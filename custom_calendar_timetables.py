@@ -313,6 +313,127 @@ class BusinessCalendarTimetable(Timetable):
         )
 
 
+@dataclass
+class BusinessCalendarTimetableNextDay(Timetable):
+    """
+    Emits runs on Tue..Sat at configured time (run_after).
+    logical_date = run_after - 1 day (Mon..Fri).
+    Skip only when the logical_date is a holiday (user requirement).
+    Catchup behavior: when deployed (no prior runs) and catchup=True, finds the most recent
+    eligible run_after <= now so last Saturday can be emitted as catchup.
+    """
+    holidays: Iterable
+    hour: int = 9
+    minute: int = 0
+    second: int = 0
+    timezone: Optional[str] = None
+
+    def __post_init__(self):
+        self._tz = _normalize_tz(self.timezone)
+        self._holidays = _to_date_set(self.holidays)
+
+    NAME: ClassVar[str] = "business_calendar_next_day"
+
+    def infer_manual_data_interval(self, run_after: Pdt) -> DataInterval:
+        return DataInterval(start=run_after, end=run_after)
+
+    def _next_run_after_candidate(self, start: Pdt) -> Pdt:
+        """
+        Find next candidate run_after >= start that falls on Tue..Sat and where the
+        logical_date (run_after - 1 day) is NOT a holiday.
+        We intentionally DO NOT skip when run_after.date() itself is a holiday (per requirement).
+        """
+        cur = start.in_timezone(self._tz)
+        candidate = _at_time(cur, self.hour, self.minute, self.second)
+        if candidate < cur:
+            candidate = candidate.add(days=1)
+
+        # Accept weekdays Tue(1) .. Sat(5)
+        for _ in range(21):
+            run_wd = candidate.weekday()  # 0=Mon .. 6=Sun
+            logical_date = candidate.subtract(days=1)
+            if run_wd in (1, 2, 3, 4, 5):  # Tue..Sat
+                if logical_date.date() not in self._holidays:
+                    return candidate.in_timezone(self._tz)
+            candidate = candidate.add(days=1)
+            candidate = _at_time(candidate, self.hour, self.minute, self.second)
+
+        return candidate.in_timezone(self._tz)
+
+    def _prev_run_after_candidate(self, start: Pdt) -> Pdt:
+        """
+        Find latest candidate run_after <= start that falls on Tue..Sat and where the
+        logical_date (run_after - 1 day) is NOT a holiday.
+        """
+        cur = start.in_timezone(self._tz)
+        candidate = _at_time(cur, self.hour, self.minute, self.second)
+        if candidate > cur:
+            candidate = candidate.subtract(days=1)
+
+        for _ in range(21):
+            run_wd = candidate.weekday()
+            logical_date = candidate.subtract(days=1)
+            if run_wd in (1, 2, 3, 4, 5):
+                if logical_date.date() not in self._holidays:
+                    return candidate.in_timezone(self._tz)
+            candidate = candidate.subtract(days=1)
+            candidate = _at_time(candidate, self.hour, self.minute, self.second)
+
+        return candidate.in_timezone(self._tz)
+
+    def next_dagrun_info(
+        self,
+        *,
+        last_automated_data_interval: Optional[DataInterval],
+        restriction: TimeRestriction,
+    ) -> Optional[DagRunInfo]:
+        now = pendulum.now(self._tz)
+
+        # Determine search base:
+        if last_automated_data_interval is None:
+            if restriction.catchup:
+                base = restriction.earliest or self._prev_run_after_candidate(now)
+            else:
+                base = max(restriction.earliest or now, now)
+        else:
+            base = last_automated_data_interval.end.in_timezone(self._tz).add(seconds=1)
+
+        run_after = self._next_run_after_candidate(base)
+
+        # If not catchup ensure returned run_after is >= now
+        if not restriction.catchup and run_after < now:
+            run_after = self._next_run_after_candidate(now)
+
+        if restriction.latest and run_after > restriction.latest:
+            return None
+
+        logical_date = run_after.subtract(days=1).in_timezone(self._tz)
+
+        interval_start = _at_time(logical_date, self.hour, self.minute, self.second)
+        interval_end = interval_start.add(days=1)
+
+        return DagRunInfo(run_after=run_after.in_timezone(self._tz), data_interval=DataInterval(start=interval_start, end=interval_end))
+
+    def serialize(self) -> Dict[str, Any]:  # type: ignore[override]
+        return {
+            "holidays": sorted([d.to_date_string() for d in self._holidays]),
+            "hour": self.hour,
+            "minute": self.minute,
+            "second": self.second,
+            "timezone": str(self._tz.name),
+        }
+
+    @classmethod
+    def deserialize(cls, data: Dict[str, Any]) -> "BusinessCalendarTimetableNextDay":  # type: ignore[override]
+        return cls(
+            holidays=data.get("holidays", []),
+            hour=data.get("hour", 9),
+            minute=data.get("minute", 0),
+            second=data.get("second", 0),
+            timezone=data.get("timezone"),
+        )
+
+
 # ---------------------------
 # 3) WeeklyCalendarTimetable
 # ---------------------------
@@ -426,7 +547,7 @@ try:
         appbuilder_views: Sequence = []
         appbuilder_menu_items: Sequence = []
         flask_blueprints: Sequence = []
-        timetables = [DemoCalendarTimetable, BusinessCalendarTimetable, WeeklyCalendarTimetable]
+        timetables = [DemoCalendarTimetable, BusinessCalendarTimetable, BusinessCalendarTimetableNextDay,WeeklyCalendarTimetable]
 
 except Exception:
     pass
